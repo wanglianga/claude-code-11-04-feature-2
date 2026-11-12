@@ -437,4 +437,179 @@ APPEND_ONLY_TABLES = [
     "ledger_entries",
     "discrepancy_actions",
     "monthly_report_versions",
+    # 特性 04：状态机决策留痕与影子重放记录均为证据，只追加
+    "event_decisions",
+    "replay_runs",
 ]
+
+
+# ================================================================
+# 特性 04：支付状态机 —— 决策留痕 / 待关联队列 / 冲突待裁决 / 隔离影子重放
+# ================================================================
+class EventDecision(Base):
+    """状态机对每条事件的评估结论，只追加。
+
+    生产决策 replay_run_id 为空；隔离重放产生的影子步骤 replay_run_id 指向对应重放，
+    decision=SHADOW。任何拒绝/冲突/无法关联都在此留下可读原因，而不是静默丢弃。
+    """
+    __tablename__ = "event_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    raw_event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("raw_events.id"), nullable=True
+    )
+    business_event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("business_events.id"), nullable=True
+    )
+    # 非空 = 影子重放步骤；为空 = 生产摄入时的真实决策
+    replay_run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("replay_runs.id"), nullable=True
+    )
+    order_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payment_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    channel_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # ACCEPTED / REJECTED / DUPLICATE / UNLINKED / CONFLICT / SHADOW
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    reason_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 转移前后状态快照（拒绝时 to_state 与 from_state 相同）
+    from_state: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    to_state: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    conflict_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("state_conflicts.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_ed_order", "order_ref"),
+        Index("ix_ed_payment", "payment_ref"),
+        Index("ix_ed_decision", "decision"),
+        Index("ix_ed_replay", "replay_run_id"),
+        Index("ix_ed_event_time", "event_time"),
+    )
+
+
+class UnlinkedEvent(Base):
+    """待关联队列：无法关联到任何订单/支付的原始事件。生命周期列可更新（非只追加）。
+
+    原始报文仍保存在 raw_events（证据不可变），本表只承载“待人工关联/丢弃”的处置状态。
+    """
+    __tablename__ = "unlinked_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    raw_event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("raw_events.id"), nullable=False, unique=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    topic: Mapped[str] = mapped_column(String(100), nullable=False)
+    # 报文中携带的关联线索（可能缺失或指向不存在的实体）
+    order_ref_hint: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payment_ref_hint: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    channel_ref_hint: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(60), nullable=False)
+    reason_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # PENDING -> LINKED / DISCARDED
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    linked_order_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    linked_payment_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolution_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_unlinked_status", "status"),
+        Index("ix_unlinked_event_time", "event_time"),
+    )
+
+
+class StateConflict(Base):
+    """状态冲突：乱序/同业务时间互斥事件无法自动定序时，保留两条记录并待人工裁决。
+
+    冲突期间两条业务事件都已只追加留存、均不覆盖状态；裁决后选定胜者驱动状态，败者置 REJECTED。
+    本表为处置工作表，裁决列允许更新（非只追加）。
+    """
+    __tablename__ = "state_conflicts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payment_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # SAME_TIMESTAMP / DUPLICATED_FACT
+    conflict_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    # PENDING -> RESOLVED / DISCARDED
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # 裁决结果：胜出/落败的业务事件
+    winning_event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("business_events.id"), nullable=True
+    )
+    losing_event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("business_events.id"), nullable=True
+    )
+    resolved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolution_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_conflict_payment_status", "payment_ref", "status"),
+        Index("ix_conflict_order", "order_ref"),
+    )
+
+
+class ReplayRun(Base):
+    """隔离影子重放运行记录，只追加。
+
+    每次重放固化生产状态快照、影子终态、逐步骤影子决策与差异结论；
+    write_back 恒为 False —— 影子重放只能对比，不能回写生产账本。
+    """
+    __tablename__ = "replay_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_ref: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    # 固定 SHADOW（隔离模式）
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="SHADOW")
+    # ORDER / PAYMENT / UNLINKED / RAW_EVENT
+    scope_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope_ref: Mapped[str] = mapped_column(String(100), nullable=False)
+    trigger_raw_event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("raw_events.id"), nullable=True
+    )
+    operator: Mapped[str] = mapped_column(String(100), nullable=False)
+    production_state: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    shadow_state: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # MATCHED / DIVERGED / BLOCKED
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    divergence_detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    step_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 恒为 False：显式记录“未回写生产”，作为隔离保证的审计字段
+    write_back: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_replay_scope", "scope_type", "scope_ref"),
+    )

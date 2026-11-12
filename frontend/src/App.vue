@@ -43,6 +43,7 @@ const menu = [
   { path: '/discrepancies', label: '财务处置队列', icon: '⚠' },
   { path: '/batches', label: '批次对账', icon: '⛓' },
   { path: '/events', label: '事件与账本', icon: '≣' },
+  { path: '/state-machine', label: '支付状态机', icon: '⎇' },
   { path: '/reports', label: '月度报表版本', icon: '◷' },
 ]
 

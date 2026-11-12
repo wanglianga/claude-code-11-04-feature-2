@@ -159,3 +159,31 @@ class BatchOut(BaseModel):
     closed_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------- 特性 04：支付状态机
+class LinkUnlinkedIn(BaseModel):
+    operator: str
+    order_ref: str = Field(..., description="人工补全的订单号")
+    payment_ref: str | None = Field(None, description="可选：补全/修正支付尝试号")
+    comment: str | None = None
+
+
+class DiscardUnlinkedIn(BaseModel):
+    operator: str
+    comment: str | None = None
+
+
+class ResolveConflictIn(BaseModel):
+    operator: str
+    winning_event_id: int = Field(..., description="裁决胜出的业务事件 ID")
+    comment: str | None = None
+
+
+class DiscardConflictIn(BaseModel):
+    operator: str
+    comment: str | None = None
+
+
+class ReplayIn(BaseModel):
+    operator: str

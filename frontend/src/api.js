@@ -51,4 +51,29 @@ export default {
   // 报表
   reports: () => api.get('/reports'),
   reportVersions: (id) => api.get(`/reports/${id}/versions`),
+
+  // 特性 04：支付状态机
+  smOrders: () => api.get('/state-machine/orders'),
+  smOrder: (orderRef) => api.get(`/state-machine/orders/${orderRef}`),
+  smDecisions: (params) => api.get('/state-machine/decisions', { params }),
+  smUnlinked: (status = 'PENDING') =>
+    api.get('/state-machine/unlinked', { params: { status } }),
+  smLink: (id, operator, order_ref, payment_ref, comment) =>
+    api.post(`/state-machine/unlinked/${id}/link`, { operator, order_ref, payment_ref, comment }),
+  smDiscardUnlinked: (id, operator, comment) =>
+    api.post(`/state-machine/unlinked/${id}/discard`, { operator, comment }),
+  smReplayUnlinked: (id, operator) =>
+    api.post(`/state-machine/unlinked/${id}/replay`, { operator }),
+  smConflicts: (status = 'PENDING') =>
+    api.get('/state-machine/conflicts', { params: { status } }),
+  smResolveConflict: (id, operator, winning_event_id, comment) =>
+    api.post(`/state-machine/conflicts/${id}/resolve`, { operator, winning_event_id, comment }),
+  smDiscardConflict: (id, operator, comment) =>
+    api.post(`/state-machine/conflicts/${id}/discard`, { operator, comment }),
+  smReplayOrder: (orderRef, operator) =>
+    api.post(`/state-machine/replay/order/${orderRef}`, { operator }),
+  smReplayRaw: (rawEventId, operator) =>
+    api.post(`/state-machine/replay/raw/${rawEventId}`, { operator }),
+  smReplays: () => api.get('/state-machine/replays'),
+  smReplay: (id) => api.get(`/state-machine/replays/${id}`),
 }

@@ -13,7 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..enums import Account, EventType, PaymentState as PS
+from ..enums import (
+    Account, EventDecision as VD, EventType, PaymentState as PS,
+    PAYMENT_LIFECYCLE_EVENTS, RejectReason as RR,
+)
 from ..models import (
     BusinessEvent, LedgerEntry, OrderState, PaymentState, RawEvent,
     SettlementBatch, SettlementLine, BankTransaction, FxRate,
@@ -90,7 +93,57 @@ async def process_event(db: AsyncSession, raw: RawEvent) -> BusinessEvent | None
         raw.status = "PROCESSED"
         raw.processed_at = _now()
         raw.reject_reason = "duplicate business_key, ledger untouched"
+        # 特性 04：重复的支付生命周期事件也在状态机视图留一条 DUPLICATE 决策
+        if event_type in PAYMENT_LIFECYCLE_EVENTS:
+            from .statemachine import add_decision
+            await add_decision(
+                db, raw_event_id=raw.id, business_event_id=existing.id,
+                replay_run_id=None, order_ref=p.get("order_ref"),
+                payment_ref=entity_ref, channel_ref=p.get("channel_ref"),
+                event_type=event_type, source=raw.source,
+                event_time=raw.event_occurred_at, decision=VD.DUPLICATE,
+                reason_code=RR.DUP_BUSINESS_KEY,
+                reason_detail="同一业务事实重复到达（L2 幂等），账本保持不变",
+            )
         return None
+
+    # ---- 特性 04：支付状态机闸门 ----
+    # 按业务时间 + 类型约束判定接受/拒绝；无法关联入待关联队列；同业务时间互斥构成冲突。
+    # 闸门在生成 business_event 之前执行：拒绝/待关联只留 raw + 决策证据，不污染业务账本。
+    gate = None
+    if event_type in PAYMENT_LIFECYCLE_EVENTS:
+        from .statemachine import (
+            assess_payment_event, queue_unlinked, add_decision,
+        )
+        gate = await assess_payment_event(db, p)
+        if gate.verdict == VD.UNLINKED:
+            await queue_unlinked(db, raw, p, gate.reason_code, gate.reason_detail)
+            await add_decision(
+                db, raw_event_id=raw.id, business_event_id=None, replay_run_id=None,
+                order_ref=p.get("order_ref"), payment_ref=entity_ref,
+                channel_ref=p.get("channel_ref"), event_type=event_type,
+                source=raw.source, event_time=raw.event_occurred_at,
+                decision=VD.UNLINKED, reason_code=gate.reason_code,
+                reason_detail=gate.reason_detail,
+            )
+            raw.status = "REJECTED"
+            raw.reject_reason = f"unlinked: {gate.reason_detail}"
+            raw.processed_at = _now()
+            return None
+        if gate.verdict == VD.REJECTED:
+            await add_decision(
+                db, raw_event_id=raw.id, business_event_id=None, replay_run_id=None,
+                order_ref=gate.target.order_ref, payment_ref=gate.target.payment_ref,
+                channel_ref=gate.target.channel_ref, event_type=event_type,
+                source=raw.source, event_time=raw.event_occurred_at,
+                decision=VD.REJECTED, reason_code=gate.reason_code,
+                reason_detail=gate.reason_detail,
+                from_state=gate.from_state, to_state=gate.from_state,
+            )
+            raw.status = "REJECTED"
+            raw.reject_reason = f"{gate.reason_code}: {gate.reason_detail}"
+            raw.processed_at = _now()
+            return None
 
     be = BusinessEvent(
         business_key=business_key,
@@ -110,6 +163,35 @@ async def process_event(db: AsyncSession, raw: RawEvent) -> BusinessEvent | None
     )
     db.add(be)
     await db.flush()
+
+    # 冲突：business_event 作为「第二条记录」只追加保留，但不跑生产处理器、不驱动状态/账本
+    if gate is not None and gate.verdict == VD.CONFLICT:
+        from .statemachine import find_existing_same_time_event, register_conflict
+        existing_be = await find_existing_same_time_event(
+            db, gate.target, be.event_time, event_type
+        )
+        conflict = await register_conflict(
+            db, gate.target, be.event_time, be, existing_be,
+            gate.reason_code or RR.CONFLICT_SAME_TIMESTAMP,
+            gate.reason_detail or "同业务时间互斥事件，待人工裁决",
+        )
+        raw.status = "PROCESSED"
+        raw.processed_at = _now()
+        raw.reject_reason = f"conflict pending adjudication #{conflict.id}"
+        return None
+
+    # 接受：记录状态机决策（含转移前后状态），随后走标准处理器与投影
+    if gate is not None and gate.verdict == VD.ACCEPTED:
+        from .statemachine import add_decision
+        await add_decision(
+            db, raw_event_id=raw.id, business_event_id=be.id, replay_run_id=None,
+            order_ref=gate.target.order_ref, payment_ref=gate.target.payment_ref,
+            channel_ref=gate.target.channel_ref, event_type=event_type,
+            source=raw.source, event_time=raw.event_occurred_at,
+            decision=VD.ACCEPTED, reason_code=gate.reason_code,
+            reason_detail=gate.reason_detail,
+            from_state=gate.from_state, to_state=gate.to_state,
+        )
 
     handler = _HANDLERS.get(event_type)
     if handler is not None:

@@ -396,3 +396,90 @@ def late_october_refund_event() -> RawEventIn:
                     # 业务发生在 10-28（已关闭周期），11-10 才人工补录
                     "event_time": "2026-10-28T10:00:00+00:00",
                 }, Decimal("10"), Decimal("0.3")))
+
+
+# ---------------------------------------------------------------- 特性 04：支付状态机专项场景
+def state_machine_events() -> list[RawEventIn]:
+    """状态机视图专项：无法关联入队、类型不变量拒绝、同业务时间冲突、多来源接受。"""
+    ev: list[RawEventIn] = []
+
+    # U1 无法关联：退款通知既无订单号也无渠道参考，entity_ref 只是退款号 -> 待关联队列
+    ev.append(_raw("WH-UNLINKED-REFUND", "WEBHOOK", "2026-10-22T09:00:00+00:00", "payment",
+                   _money_payload({
+                       "event_type": "REFUND_SUCCEEDED", "entity_type": "REFUND",
+                       "entity_ref": "R-UNKNOWN-1",
+                       "business_key": "REFUND_SUCCEEDED:R-UNKNOWN-1:v1",
+                   }, Decimal("20"))))
+
+    # U2 无法关联：指向系统中不存在的订单 ORD-999，且无渠道参考可自建支付态
+    ev.append(_raw("WH-UNLINKED-ORD999", "WEBHOOK", "2026-10-22T09:10:00+00:00", "payment",
+                   _money_payload({
+                       "event_type": "REFUND_SUCCEEDED", "entity_type": "REFUND",
+                       "entity_ref": "R-999", "order_ref": "ORD-999",
+                       "business_key": "REFUND_SUCCEEDED:R-999:v1",
+                   }, Decimal("10"))))
+
+    # R1 拒绝（类型约束）：P-003 已于 10-08 捕获，10-09（更晚业务时间）又来授权 -> 已捕获后禁止授权
+    ev.append(_raw("WH-P-003-AUTH-LATE", "WEBHOOK", "2026-10-09T10:00:00+00:00", "payment", {
+        "event_type": "PAYMENT_AUTHORIZED", "entity_type": "AUTHORIZATION",
+        "entity_ref": "P-003", "order_ref": "ORD-003", "channel_ref": "CH-P003",
+        "business_key": "PAYMENT_AUTHORIZED:P-003:LATE-v1",
+        "amount": "60", "txn_currency": "USD",
+    }))
+
+    # R2 拒绝（金额不变量）：ORD-004 仅捕获 50，退款 60 超过捕获额
+    ev.append(_raw("WH-P-004-REF-OVER", "WEBHOOK", "2026-10-23T10:00:00+00:00", "payment",
+                   _money_payload({
+                       "event_type": "REFUND_SUCCEEDED", "entity_type": "REFUND",
+                       "entity_ref": "R-004-OVER", "order_ref": "ORD-004",
+                       "channel_ref": "CH-P004",
+                       "business_key": "REFUND_SUCCEEDED:R-004-OVER:v1",
+                   }, Decimal("60"))))
+
+    # C1 冲突：ORD-010 在同一业务时间 10-21 10:00 同时出现「捕获」(webhook) 与「失败」(轮询)，
+    # 互斥且无法自动定序 -> 两条业务记录都保留，标记 PENDING 待人工裁决，互不覆盖状态。
+    ev.append(_raw("CDC-ORD-010", "CDC", "2026-10-21T09:00:00+00:00", "order.order", {
+        "event_type": "ORDER_PAID", "entity_type": "ORDER",
+        "entity_ref": "ORD-010", "order_ref": "ORD-010",
+        "business_key": "ORDER_PAID:ORD-010:v1",
+        "order_status": "PAID", "amount": "40", "txn_currency": "USD",
+    }))
+    ev.append(_raw("WH-P-010-CREATED", "WEBHOOK", "2026-10-21T09:30:00+00:00", "payment", {
+        "event_type": "PAYMENT_CREATED", "entity_type": "PAYMENT_ATTEMPT",
+        "entity_ref": "P-010", "order_ref": "ORD-010", "channel_ref": "CH-P010",
+        "business_key": "PAYMENT_CREATED:P-010:v1",
+        "amount": "40", "txn_currency": "USD",
+    }))
+    ev.append(_raw("WH-P-010-CAP", "WEBHOOK", "2026-10-21T10:00:00+00:00", "payment",
+                   _money_payload({
+                       "event_type": "PAYMENT_CAPTURED", "entity_type": "CAPTURE",
+                       "entity_ref": "P-010", "order_ref": "ORD-010", "channel_ref": "CH-P010",
+                       "business_key": "PAYMENT_CAPTURED:P-010:v1",
+                   }, Decimal("40"), Decimal("1.2"))))
+    ev.append(_raw("POLL-P-010-FAILED", "POLL", "2026-10-21T10:00:00+00:00", "payment.poll", {
+        "event_type": "PAYMENT_FAILED", "entity_type": "PAYMENT_ATTEMPT",
+        "entity_ref": "P-010", "order_ref": "ORD-010", "channel_ref": "CH-P010",
+        "business_key": "PAYMENT_FAILED:P-010:v1",
+        "amount": "40", "txn_currency": "USD",
+    }))
+
+    # A1 多来源接受：ORD-011 授权由 webhook 送达、轮询补拉同一支付的创建事实（不同业务事实，均 ACCEPTED）
+    ev.append(_raw("CDC-ORD-011", "CDC", "2026-10-24T09:00:00+00:00", "order.order", {
+        "event_type": "ORDER_PAID", "entity_type": "ORDER",
+        "entity_ref": "ORD-011", "order_ref": "ORD-011",
+        "business_key": "ORDER_PAID:ORD-011:v1",
+        "order_status": "PAID", "amount": "30", "txn_currency": "USD",
+    }))
+    ev.append(_raw("POLL-P-011-CREATED", "POLL", "2026-10-24T09:30:00+00:00", "payment.poll", {
+        "event_type": "PAYMENT_CREATED", "entity_type": "PAYMENT_ATTEMPT",
+        "entity_ref": "P-011", "order_ref": "ORD-011", "channel_ref": "CH-P011",
+        "business_key": "PAYMENT_CREATED:P-011:v1",
+        "amount": "30", "txn_currency": "USD",
+    }))
+    ev.append(_raw("WH-P-011-AUTH", "WEBHOOK", "2026-10-24T10:00:00+00:00", "payment", {
+        "event_type": "PAYMENT_AUTHORIZED", "entity_type": "AUTHORIZATION",
+        "entity_ref": "P-011", "order_ref": "ORD-011", "channel_ref": "CH-P011",
+        "business_key": "PAYMENT_AUTHORIZED:P-011:v1",
+        "amount": "30", "txn_currency": "USD",
+    }))
+    return ev

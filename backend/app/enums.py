@@ -7,7 +7,6 @@ class EventSource:
     POLL = "POLL"            # 渠道轮询补拉
     MANUAL = "MANUAL"        # 人工补单 / 手工调账
 
-
 class EntityType:
     ORDER = "ORDER"
     PAYMENT_ATTEMPT = "PAYMENT_ATTEMPT"
@@ -113,3 +112,90 @@ class Account:
     FX_GAIN_LOSS = "FX_GAIN_LOSS"             # 汇率更正损益
     MANUAL_ADJUSTMENT = "MANUAL_ADJUSTMENT"   # 手工调账
     ROUNDING = "ROUNDING"                     # 舍入差
+
+
+# ================================================================
+# 支付状态机（特性 04）：接受/拒绝决策、待关联队列、冲突待裁决、隔离影子重放
+# ================================================================
+
+class EventDecision:
+    """单条事件经状态机评估后的处置结论（只追加留痕）。"""
+    ACCEPTED = "ACCEPTED"            # 接受：转移合法，驱动（或不改变）当前状态
+    REJECTED = "REJECTED"            # 拒绝：违反类型约束/业务时间顺序
+    DUPLICATE = "DUPLICATE"          # 同一业务事实重复到达（两层幂等拦截，状态机不重复处理）
+    UNLINKED = "UNLINKED"            # 无法关联到任何订单/支付，进入待关联队列
+    CONFLICT = "CONFLICT"            # 与既有事件同业务时间且互斥，保留两条并待人工裁决
+    SHADOW = "SHADOW"                # 隔离重放产生的影子步骤（不回写生产账本）
+
+
+class RejectReason:
+    """拒绝/特殊处置原因码（机器可读，前端可直接映射中文说明）。"""
+    DUP_BUSINESS_KEY = "DUP_BUSINESS_KEY"                  # 业务键重复，账本保持不变
+    DUP_RAW_MESSAGE = "DUP_RAW_MESSAGE"                    # 来源消息重复（L1 幂等）
+    UNLINKED_NO_ORDER_OR_PAYMENT = "UNLINKED_NO_ORDER_OR_PAYMENT"  # 缺少订单号/支付号/渠道参考，无法关联
+    UNLINKED_UNKNOWN_ORDER = "UNLINKED_UNKNOWN_ORDER"      # 引用的订单/支付在系统中不存在
+    ILLEGAL_BEFORE_CREATED = "ILLEGAL_BEFORE_CREATED"      # 支付尚未创建即收到生命周期事件
+    ILLEGAL_AUTH_AFTER_CAPTURE = "ILLEGAL_AUTH_AFTER_CAPTURE"      # 已捕获后不允许再授权
+    ILLEGAL_CAPTURE_WITHOUT_AUTH = "ILLEGAL_CAPTURE_WITHOUT_AUTH"  # 未授权即捕获（且无授权事件）
+    ILLEGAL_CAPTURE_AFTER_REFUND = "ILLEGAL_CAPTURE_AFTER_REFUND"  # 已全额退款后不允许再捕获
+    ILLEGAL_REFUND_EXCEEDS_CAPTURE = "ILLEGAL_REFUND_EXCEEDS_CAPTURE"  # 退款累计超过捕获金额
+    ILLEGAL_CHARGEBACK_WITHOUT_CAPTURE = "ILLEGAL_CHARGEBACK_WITHOUT_CAPTURE"  # 未捕获即拒付
+    ILLEGAL_REVERSAL_WITHOUT_CHARGEBACK = "ILLEGAL_REVERSAL_WITHOUT_CHARGEBACK"  # 无拒付却来拒付反转
+    ILLEGAL_AUTH_EXPIRED_AFTER_CAPTURE = "ILLEGAL_AUTH_EXPIRED_AFTER_CAPTURE"  # 已捕获后授权过期无效
+    ILLEGAL_FAILED_AFTER_CAPTURE = "ILLEGAL_FAILED_AFTER_CAPTURE"  # 已捕获后支付失败通知无效
+    OUT_OF_ORDER_OLDER_EVENT = "OUT_OF_ORDER_OLDER_EVENT"  # 业务时间早于当前驱动事件，迟到不覆盖
+    CONFLICT_SAME_TIMESTAMP = "CONFLICT_SAME_TIMESTAMP"    # 同业务时间互斥事件，待裁决
+    CONFLICT_DUPLICATED_FACT = "CONFLICT_DUPLICATED_FACT"  # 同一事实不同取值（如金额不一致），待裁决
+    CONFLICT_PENDING = "CONFLICT_PENDING"                  # 该支付存在未裁决冲突，新事件先挂起
+    UNKNOWN_EVENT_TYPE = "UNKNOWN_EVENT_TYPE"              # 状态机不认识的事件类型
+
+
+class UnlinkedStatus:
+    """待关联队列生命周期（该表可更新，非只追加）。"""
+    PENDING = "PENDING"        # 待人工关联
+    LINKED = "LINKED"          # 已人工关联到订单/支付，重新进入状态机
+    DISCARDED = "DISCARDED"    # 人工判定为无效事件，丢弃（原始 raw_event 仍保留）
+
+
+class ConflictStatus:
+    """状态冲突裁决状态（该表可更新，非只追加）。"""
+    PENDING = "PENDING"        # 待裁决：两条互斥记录都保留
+    RESOLVED = "RESOLVED"      # 已裁决：选定胜者，败者标记 REJECTED
+    DISCARDED = "DISCARDED"    # 人工判定整组无效
+
+
+class ReplayMode:
+    """重放隔离级别。"""
+    SHADOW = "SHADOW"          # 影子重放：只生成影子状态，禁止任何生产回写
+
+
+class ReplayOutcome:
+    MATCHED = "MATCHED"        # 影子终态与生产当前状态一致
+    DIVERGED = "DIVERGED"      # 影子终态与生产当前状态不一致，需人工对比
+    BLOCKED = "BLOCKED"        # 重放过程中存在拒绝/冲突，影子状态不完整
+
+
+# 支付生命周期事件集合（授权/捕获/退款/拒付/反转，以及创建/失败/过期）
+PAYMENT_LIFECYCLE_EVENTS = frozenset({
+    "PAYMENT_CREATED",
+    "PAYMENT_AUTHORIZED",
+    "PAYMENT_AUTH_EXPIRED",
+    "PAYMENT_CAPTURED",
+    "PAYMENT_FAILED",
+    "REFUND_REQUESTED",
+    "REFUND_SUCCEEDED",
+    "CHARGEBACK_OPENED",
+    "CHARGEBACK_REVERSED",
+})
+
+# 会真正驱动支付状态机迁移的事件（REFUND_REQUESTED 仅登记意图，不改累计金额态）
+PAYMENT_STATE_DRIVING_EVENTS = frozenset({
+    "PAYMENT_CREATED",
+    "PAYMENT_AUTHORIZED",
+    "PAYMENT_AUTH_EXPIRED",
+    "PAYMENT_CAPTURED",
+    "PAYMENT_FAILED",
+    "REFUND_SUCCEEDED",
+    "CHARGEBACK_OPENED",
+    "CHARGEBACK_REVERSED",
+})

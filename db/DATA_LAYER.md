@@ -36,10 +36,29 @@ CDC/Webhook/轮询/人工 → raw_events       → business_events（归一化�
 - `monthly_report_versions`：快照 JSONB 不可变；新版本产生时旧版本仅 `version_status` 置 `SUPERSEDED`（触发器放行该列），快照行本身禁改禁删。
 - 快照内置 `conservation_check` 借贷守恒校验与指纹，内容无变化时复用当前版本。
 
+### 支付状态机视图（特性 04，跨 L1/L2 的决策与隔离重放层）
+- `event_decisions`（**只追加**）：状态机对每条支付生命周期事件的评估结论
+  `ACCEPTED / REJECTED / DUPLICATE / UNLINKED / CONFLICT / SHADOW`，带 `reason_code`、
+  转移前后状态 `from_state/to_state`、关联订单/支付/渠道。生产决策 `replay_run_id` 为空；
+  隔离重放步骤 `replay_run_id` 指向对应运行且 `decision=SHADOW`。
+- `unlinked_events`（可更新的处置工作表）：无法关联到任何订单/支付的原始事件进入待关联队列，
+  原始报文仍在 `raw_events` 不可变留存；状态 `PENDING -> LINKED / DISCARDED`，
+  人工关联后用新幂等键重新投递进入标准两层幂等 + 状态机闸门。
+- `state_conflicts`（可更新的处置工作表）：同业务时间互斥事件无法自动定序时，
+  两条 `business_events` 都只追加保留、互不覆盖状态，冲突 `PENDING` 待人工裁决；
+  裁决后胜者 `ADJUDICATED_WINNER` 生效、败者 `ADJUDICATED_LOSER` 留 REJECTED 但记录不删，
+  败者若已过账则追加红冲 `MANUAL_ADJUSTMENT` 保持借贷守恒。
+- `replay_runs`（**只追加**）：隔离 SHADOW 重放运行，固化生产态快照、影子终态、
+  逐步骤影子决策与 `MATCHED/DIVERGED/BLOCKED` 结论；`write_back` 恒为 `false`，
+  重放只读生产、只写 `replay_runs`/SHADOW 决策，绝不回写 `business_events`/`ledger_entries`/投影。
+- 乱序安全：闸门把「已存事件 + 候选事件」合并后按业务时间 `event_time` 整体重放，
+  迟到前置事件自动归位（决策 reason_detail 标注「迟到不回退」），只拒绝真正的业务不变量违规
+  （如已捕获后更晚授权、退款超过捕获），不按到达顺序覆盖状态。
+
 ## 只追加触发器（PostgreSQL）
 
 `app/init_db.py` 为以下表安装 `BEFORE UPDATE OR DELETE` 与 `BEFORE TRUNCATE` 触发器：
-`raw_events, business_events, fx_rates, ledger_entries, discrepancy_actions, monthly_report_versions`。
+`raw_events, business_events, fx_rates, ledger_entries, discrepancy_actions, monthly_report_versions, event_decisions, replay_runs`。
 
 - 任何 UPDATE/DELETE/TRUNCATE 直接抛异常（`raw_events` 生命周期列、报表版本状态列例外，证据列仍不可改）。
 - 被外键引用的表，TRUNCATE 还会先被外键约束拦截。

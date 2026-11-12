@@ -81,15 +81,30 @@ async def main(reset: bool = False) -> None:
             await conn.execute(text("CREATE SCHEMA public"))
     await init_db()
     async with SessionLocal() as db:
-        print("== 1. 摄入汇率与订单/支付事件 ==")
+        print("== 1. 摄入汇率与订单/支付事件（含状态机：待关联/拒绝/冲突/多来源） ==")
         raw_count = dup_count = be_count = 0
-        for ev in [*demo.fx_events(), *demo.order_payment_events()]:
+        for ev in [*demo.fx_events(), *demo.order_payment_events(),
+                   *demo.state_machine_events()]:
             _, dup, be = await _ingest(db, ev)
             raw_count += 1
             dup_count += int(dup)
             be_count += int(be is not None)
         await db.commit()
         print(f"   原始消息 {raw_count} 条，其中重复投递 {dup_count} 条，新增业务事件 {be_count} 条")
+
+        # 状态机视图概览：决策分布 / 待关联 / 待裁决冲突
+        from app.enums import EventDecision as VD
+        from app.models import EventDecision, UnlinkedEvent, StateConflict
+        from app.services.statemachine import list_unlinked, list_conflicts
+        dec_rows = (await db.execute(
+            select(EventDecision.decision).where(EventDecision.replay_run_id.is_(None))
+        )).scalars().all()
+        dec_summary: dict[str, int] = {}
+        for d in dec_rows:
+            dec_summary[d] = dec_summary.get(d, 0) + 1
+        print(f"   状态机决策分布：{dec_summary}")
+        print(f"   待关联队列：{len(await list_unlinked(db))} 条；"
+              f"待裁决冲突：{len(await list_conflicts(db))} 条")
 
         print("== 2. 摄入银行流水（合并入账/延迟入账）与结算单 v1 ==")
         for ev in demo.bank_events():
@@ -174,6 +189,24 @@ async def main(reset: bool = False) -> None:
         new_versions = await regenerate_closed_reports(db)
         await db.commit()
         print(f"   补单触发新报表版本：{new_versions}")
+
+        print("== 8b. 支付状态机隔离影子重放（只读生产、绝不回写） ==")
+        from app.services import statemachine as sm
+        replay = await sm.replay_order(db, "ORD-002", OPERATOR)
+        print(
+            f"   影子重放 ORD-002：outcome={replay['outcome']} "
+            f"steps={replay['step_count']} write_back={replay['write_back']}"
+        )
+        assert replay["write_back"] is False, "影子重放禁止回写生产账本"
+        pending_unlinked = await sm.list_unlinked(db)
+        if pending_unlinked:
+            ul_run = await sm.replay_unlinked(db, pending_unlinked[0].id, OPERATOR)
+            print(
+                f"   待关联事件隔离重放：outcome={ul_run['outcome']} "
+                f"原因={ul_run['divergence_detail'].get('reason_code')} "
+                f"write_back={ul_run['write_back']}"
+            )
+        await db.commit()
 
         print("== 9. 最终汇总 ==")
         versions = (

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .init_db import init_db
 from .routers import events as events_router
 from .routers import reconciliation as recon_router
+from .routers import statemachine as statemachine_router
 
 
 @asynccontextmanager
@@ -33,6 +34,7 @@ app.add_middleware(
 
 app.include_router(events_router.router)
 app.include_router(recon_router.router)
+app.include_router(statemachine_router.router)
 
 
 @app.get("/health", tags=["meta"])
